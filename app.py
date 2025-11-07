@@ -173,6 +173,32 @@ def can_join(pid, pod):
     # So this always returns True; we’ll enforce the "no exact pod repeat" at the pod level.
     return True
 
+def compute_a_sos(include_only_completed_rounds: bool = True):
+    """Return (a_sos_by_pid, opp_apps_by_pid) using per-appearance SOS."""
+    players = st.session_state.players
+    sos_sum = {pid: 0 for pid in players}
+    opp_apps = {pid: 0 for pid in players}
+
+    for rnd in st.session_state.rounds:
+        if include_only_completed_rounds and not all(p.winner is not None for p in rnd.pods):
+            continue
+        for pod in rnd.pods:
+            if include_only_completed_rounds and pod.winner is None:
+                continue
+            ids = [pid for pid in pod.players if pid in players]
+            for a in ids:
+                for b in ids:
+                    if a == b:
+                        continue
+                    sos_sum[a] += players[b].points
+                    opp_apps[a] += 1
+
+    a_sos = {
+        pid: (sos_sum[pid] / opp_apps[pid]) if opp_apps[pid] > 0 else 0.0
+        for pid in players
+    }
+    return a_sos, opp_apps
+
 def pod_sizes_only_3_4(n: int):
     """Return [4,4,...,3,3,...] or None if impossible (only 3- and 4-player pods allowed)."""
     if n in (1, 2, 5):
@@ -288,7 +314,7 @@ def pair_round(duration_minutes: int | None):
 
     record_pods_in_history(pods)
     save_state()
-
+    
 def pair_round_swiss(duration_minutes: int | None):
     players = [p for p in not_dropped_players()]
     n = len(players)
@@ -302,8 +328,9 @@ def pair_round_swiss(duration_minutes: int | None):
         st.warning("Current active players cannot be partitioned into only 3- and 4-player pods. Add/drop players.")
         return
 
-    # Swiss order: higher points first (seed tiebreaker for equal points)
-    players.sort(key=lambda p: (-p.points, p.seed))
+    # ✅ Sort exactly like standings: Points -> A-SOS -> seed
+    a_sos, _ = compute_a_sos(include_only_completed_rounds=True)
+    players.sort(key=lambda p: (-p.points, -a_sos[p.id], p.seed))
     ids = [p.id for p in players]
 
     # Minimal number of 3-pods, assigned to the lowest scorers
@@ -312,16 +339,11 @@ def pair_round_swiss(duration_minutes: int | None):
     high_block = ids[: n - 3 * num3]
 
     pods: list[Pod] = []
-
-    # 1) Build 4-pods from the top block, left-to-right, deterministic (no shuffles)
     for i in range(0, len(high_block), 4):
         pods.append(Pod(players=high_block[i:i+4]))
-
-    # 2) Build 3-pods from the reserved bottom block, left-to-right
     for i in range(0, len(low_block), 3):
         pods.append(Pod(players=low_block[i:i+3]))
 
-    # Commit round
     rno = len(st.session_state.rounds) + 1
     rnd = Round(
         number=rno,
@@ -331,7 +353,6 @@ def pair_round_swiss(duration_minutes: int | None):
     )
     st.session_state.rounds.append(rnd)
 
-    # Update opponent history (optional but harmless for tiebreakers like A-SOS)
     pm = st.session_state.players
     for pod in pods:
         for a in pod.players:
@@ -339,8 +360,8 @@ def pair_round_swiss(duration_minutes: int | None):
                 if a != b:
                     pm[a].opponents.add(b)
 
-    # (We intentionally do NOT record pod signatures — repetition is allowed.)
     save_state()
+
 def submit_results(rno, winners, custom_ties=None):
     custom_ties = custom_ties or {}
     rnd = st.session_state.rounds[rno-1]
@@ -459,34 +480,11 @@ def export_history_csv():
     return df.to_csv(index=False)
 def standings_rows():
     players = st.session_state.players
-
-    # Per-appearance SOS over COMPLETED pods only
-    sos_sum = {pid: 0 for pid in players}
-    opp_apps = {pid: 0 for pid in players}
-
-    for rnd in st.session_state.rounds:
-        # Skip incomplete rounds
-        if not all(p.winner is not None for p in rnd.pods):
-            continue        
-        for pod in rnd.pods:
-            if pod.winner is None:
-                continue  # skip unplayed pods so current round doesn't affect A-SOS
-            ids = [pid for pid in pod.players if pid in players]
-            for a in ids:
-                for b in ids:
-                    if a == b:
-                        continue
-                    sos_sum[a] += players[b].points
-                    opp_apps[a] += 1
-
-    a_sos = {
-        pid: (sos_sum[pid] / opp_apps[pid]) if opp_apps[pid] > 0 else 0.0
-        for pid in players
-    }
+    a_sos, opp_apps = compute_a_sos(include_only_completed_rounds=True)
 
     ordered = sorted(
         players.values(),
-        key=lambda x: (-x.points, -a_sos[x.id], x.name)
+        key=lambda p: (-p.points, -a_sos[p.id], p.seed)
     )
 
     rows = []

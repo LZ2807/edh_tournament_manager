@@ -460,12 +460,17 @@ def export_history_csv():
 def standings_rows():
     players = st.session_state.players
 
-    # Per-appearance SOS (handles repeats & 3/4 pods correctly)
+    # Per-appearance SOS over COMPLETED pods only
     sos_sum = {pid: 0 for pid in players}
     opp_apps = {pid: 0 for pid in players}
 
     for rnd in st.session_state.rounds:
+        # Skip incomplete rounds
+        if not all(p.winner is not None for p in rnd.pods):
+            continue        
         for pod in rnd.pods:
+            if pod.winner is None:
+                continue  # skip unplayed pods so current round doesn't affect A-SOS
             ids = [pid for pid in pod.players if pid in players]
             for a in ids:
                 for b in ids:
@@ -479,10 +484,6 @@ def standings_rows():
         for pid in players
     }
 
-    # (Optional) keep old unique-opponent SOS for reference/debug
-    # uniq_sos = {pid: sum(players[q].points for q in players[pid].opponents if q in players) for pid in players}
-    # uniq_cnt = {pid: len([q for q in players[pid].opponents if q in players]) for pid in players}
-
     ordered = sorted(
         players.values(),
         key=lambda x: (-x.points, -a_sos[x.id], x.name)
@@ -495,9 +496,7 @@ def standings_rows():
             "Name": p.name,
             "Points": p.points,
             "A-SOS": round(a_sos[p.id], 3),
-            "Opp Apps": opp_apps[p.id],          # how many opponent slots faced
-            # "SOS(unique)": uniq_sos.get(p.id, 0),  # optional debug columns
-            # "Opp Unique": uniq_cnt.get(p.id, 0),
+            "Opp Apps": opp_apps[p.id],
             "Status": "Dropped" if p.dropped else ""
         })
     return rows

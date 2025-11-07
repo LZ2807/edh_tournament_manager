@@ -45,7 +45,8 @@ class Player:
 @dataclass
 class Pod:
     players: list           # list of player ids
-    winner: str | None = None
+    winner: str | None = None   # player id, "Tie", or None
+    tie_recipients: list[str] = field(default_factory=list)  # ids who got 1pt on a tie
 
 @dataclass
 class Round:
@@ -66,7 +67,7 @@ def load_state():
         st.session_state.players = {pid: Player.from_json(pd) for pid, pd in data["players"].items()}
         st.session_state.rounds = []
         for r in data["rounds"]:
-            pods = [Pod(p["players"], p.get("winner")) for p in r["pods"]]
+            pods = [Pod(p["players"], p.get("winner"), p.get("tie_recipients", [])) for p in r["pods"]]
             st.session_state.rounds.append(Round(
                 number=r["number"],
                 pods=pods,
@@ -86,7 +87,7 @@ def save_state():
             "players": {pid: st.session_state.players[pid].to_json() for pid in st.session_state.players},
             "rounds": [{
                 "number": r.number,
-                "pods": [{"players": p.players, "winner": p.winner} for p in r.pods],
+                "pods": [{"players": p.players, "winner": p.winner, "tie_recipients": p.tie_recipients} for p in r.pods],
                 "start_ts": r.start_ts,
                 "duration_minutes": r.duration_minutes,
                 "timeout_awarded": r.timeout_awarded
@@ -172,77 +173,50 @@ def can_join(pid, pod):
     # So this always returns True; we’ll enforce the "no exact pod repeat" at the pod level.
     return True
 
+def pod_sizes_only_3_4(n: int):
+    """Return [4,4,...,3,3,...] or None if impossible (only 3- and 4-player pods allowed)."""
+    if n in (1, 2, 5):
+        return None
+    r = n % 4
+    needed_3 = {0: 0, 1: 3, 2: 2, 3: 1}[r]
+    if r == 1 and n < 9:  # smallest r==1 split is 9 = 3+3+3
+        return None
+    num4 = (n - 3 * needed_3) // 4
+    return [4] * num4 + [3] * needed_3
+
 def pair_round(duration_minutes: int | None):
     players = [p for p in not_dropped_players()]
     n = len(players)
 
     if n < MIN_POD:
-        st.error("Need at least 3 active (not dropped) players to pair a round.")
+        st.warning("Need at least 3 active (not dropped) players to pair a round.")
         return
 
-    # With only 3- and 4-player pods allowed, 5 players cannot be partitioned.
-    if n in (1, 2, 5):
-        st.error("Cannot form only 3- or 4-player pods with 5 players. Add or drop a player.")
+    sizes = pod_sizes_only_3_4(n)
+    if sizes is None:
+        st.warning("Current active players cannot be partitioned into only 3- and 4-player pods. Add/drop players.")
         return
 
-    # Sort by points desc then seed for stability/randomness
+    # Swiss order: higher points first (seed tiebreaker for equal points)
     players.sort(key=lambda p: (-p.points, p.seed))
-    pool = [p.id for p in players]
+    ids = [p.id for p in players]
 
-    # Decide exact pod sizes we want: only 3s and 4s, never >4
-    r = n % 4
-    # Minimal number of 3-pods to cover leftovers (classic composition)
-    needed_3 = {0: 0, 1: 3, 2: 2, 3: 1}[r]
-    # (For r==1 we need at least 9 players; n==5 already handled above.)
-    if r == 1 and n < 9:
-        st.error("With 5 players disallowed, the smallest valid 'r==1' case is 9 (three 3-pods). Add/drop players.")
-        return
-    num4 = (n - 3 * needed_3) // 4
-    sizes = [4] * num4 + [3] * needed_3  # e.g., [4,4,3] etc.
+    # Minimal number of 3-pods, assigned to the lowest scorers
+    num3 = sizes.count(3)
+    low_block  = ids[-3 * num3:] if num3 else []
+    high_block = ids[: n - 3 * num3]
 
     pods: list[Pod] = []
-    MAX_TRIES = 300
-    success = False
 
-    for i in range(MAX_TRIES):
-        temp_pool = pool[:]
-        random.shuffle(temp_pool)  # try a different order each attempt
-        temp_pods: list[Pod] = []
-        ok = True
+    # 1) Build 4-pods from the top block, left-to-right, deterministic (no shuffles)
+    for i in range(0, len(high_block), 4):
+        pods.append(Pod(players=high_block[i:i+4]))
 
-        for size in sizes:
-            # Greedy take 'size' players; avoid exact pod repeats
-            chosen = temp_pool[:size]
-            # If this exact pod existed, try to tweak by swapping one seat
-            if exact_pod_exists(chosen) or i == MAX_TRIES-1:
-                made = False
-                # Try some alternative combinations among the first few candidates
-                cap = min(len(temp_pool), max(size + 6, 12))
-                for combo in combinations(temp_pool[:cap], size):
-                    combo = list(combo)
-                    if not exact_pod_exists(combo) or i == MAX_TRIES-1:
-                        chosen = combo
-                        made = True
-                        break
-                if not made:
-                    ok = False
-                    break
+    # 2) Build 3-pods from the reserved bottom block, left-to-right
+    for i in range(0, len(low_block), 3):
+        pods.append(Pod(players=low_block[i:i+3]))
 
-            # Commit this pod and remove its players from pool
-            pid_set = set(chosen)
-            temp_pool = [x for x in temp_pool if x not in pid_set]
-            temp_pods.append(Pod(players=chosen))
-
-        if ok and len(temp_pool) == 0:
-            pods = temp_pods
-            success = True
-            break
-
-    if not success:
-        st.error("Could not form pods without repeats under current constraints. Try clicking again or toggling a drop.")
-        return
-
-    # Create round (timer etc.)
+    # Commit round
     rno = len(st.session_state.rounds) + 1
     rnd = Round(
         number=rno,
@@ -252,21 +226,18 @@ def pair_round(duration_minutes: int | None):
     )
     st.session_state.rounds.append(rnd)
 
-    # Update opponent history
-    players_map = st.session_state.players
+    # Update opponent history (optional but harmless for tiebreakers like A-SOS)
+    pm = st.session_state.players
     for pod in pods:
-        assert 3 <= len(pod.players) <= 4, "Pod size invariant violated"
         for a in pod.players:
             for b in pod.players:
                 if a != b:
-                    players_map[a].opponents.add(b)
+                    pm[a].opponents.add(b)
 
-    # Record pod signatures & persist
-    record_pods_in_history(pods)
+    # (We intentionally do NOT record pod signatures — repetition is allowed.)
     save_state()
-    
-
-def submit_results(rno, winners):
+def submit_results(rno, winners, custom_ties=None):
+    custom_ties = custom_ties or {}
     rnd = st.session_state.rounds[rno-1]
     players = st.session_state.players
     name_to_id = {p.name.lower(): p.id for p in players.values()}
@@ -275,64 +246,81 @@ def submit_results(rno, winners):
         if i not in winners:
             continue
         w = winners[i]
-        if w == 'Tie':
+
+        if w == 'Tie (everyone)':
+            pod.winner = "Tie"
+            pod.tie_recipients = pod.players[:]
             for pid in pod.players:
-                pod.winner = "Tie"
                 players[pid].points += 1
             continue
+
+        if w == 'Tie (custom)':
+            ids = [pid for pid in custom_ties.get(i, []) if pid in pod.players]
+            if not ids:
+                st.warning(f"No players selected for Tie in Pod {i+1}.")
+                continue
+            pod.winner = "Tie"
+            pod.tie_recipients = ids
+            for pid in ids:
+                players[pid].points += 1
+            continue
+
+        # normal single-winner (accept name or id)
         wid = players[w].id if w in players else name_to_id.get(w.lower())
         if wid is None or wid not in pod.players:
             st.error(f"Winner '{w}' not in Pod {i+1}.")
             return
-        if pod.winner:
-            continue
         pod.winner = wid
+        pod.tie_recipients = []
         players[wid].points += WIN_POINTS
+
     save_state()
     create_backup(rnd)
-def change_pod_winner(rno: int, pod_index: int, new_winner_label: str):
-    """Change/clear a pod's winner and fix points accordingly.
-       new_winner_label can be: 'None (clear)', 'Tie', a player name, or a player id.
-    """
+def change_pod_winner(rno: int, pod_index: int, new_winner_label: str, tie_ids: list[str] | None = None):
     rnd = st.session_state.rounds[rno - 1]
     pod = rnd.pods[pod_index]
     players = st.session_state.players
-
-    # map names -> ids
     name_to_id = {p.name.lower(): p.id for p in players.values()}
 
-    # ---- rollback old result ----
+    # rollback old
     prev = pod.winner
     if prev is not None:
         if prev == "Tie":
-            for pid in pod.players:
+            recips = pod.tie_recipients if pod.tie_recipients else pod.players
+            for pid in recips:
                 players[pid].points = max(0, players[pid].points - 1)
         else:
-            # prev should be a player id
             if prev in players:
                 players[prev].points = max(0, players[prev].points - WIN_POINTS)
 
-    # ---- apply new result ----
+    # apply new
     if new_winner_label in (None, "", "None", "None (clear)"):
         pod.winner = None
-    elif new_winner_label == "Tie":
+        pod.tie_recipients = []
+    elif new_winner_label in ("Tie", "Tie (everyone)"):
         pod.winner = "Tie"
+        pod.tie_recipients = pod.players[:]
         for pid in pod.players:
             players[pid].points += 1
+    elif new_winner_label == "Tie (custom)":
+        tie_ids = [pid for pid in (tie_ids or []) if pid in pod.players]
+        if not tie_ids:
+            st.error(f"No valid players selected for Tie in Pod {pod_index+1}.")
+            return
+        pod.winner = "Tie"
+        pod.tie_recipients = tie_ids
+        for pid in tie_ids:
+            players[pid].points += 1
     else:
-        # accept player id or name
-        if new_winner_label in players:
-            wid = new_winner_label
-        else:
-            wid = name_to_id.get(new_winner_label.lower())
+        wid = new_winner_label if new_winner_label in players else name_to_id.get(new_winner_label.lower())
         if wid is None or wid not in pod.players:
             st.error(f"New winner '{new_winner_label}' is not in Pod {pod_index+1}.")
             return
         pod.winner = wid
+        pod.tie_recipients = []
         players[wid].points += WIN_POINTS
 
     save_state()
-    # optional: keep your backup snapshot
     create_backup(rnd)
     st.rerun()
 
@@ -364,29 +352,49 @@ def export_history_csv():
             })
     df = pd.DataFrame(rows)
     return df.to_csv(index=False)
-
 def standings_rows():
     players = st.session_state.players
-    # SOS tiebreaker (sum of opponents' points)
 
-    sos = {}
-    opp_counts = {}
-    for pid, p in players.items():
-        opp_ids = [q for q in p.opponents if q in players]
-        opp_counts[pid] = len(opp_ids)
-        sos[pid] = sum(players[q].points for q in opp_ids)
+    # Per-appearance SOS (handles repeats & 3/4 pods correctly)
+    sos_sum = {pid: 0 for pid in players}
+    opp_apps = {pid: 0 for pid in players}
 
-    # Average SOS (handles uneven pod sizes)
+    for rnd in st.session_state.rounds:
+        for pod in rnd.pods:
+            ids = [pid for pid in pod.players if pid in players]
+            for a in ids:
+                for b in ids:
+                    if a == b:
+                        continue
+                    sos_sum[a] += players[b].points
+                    opp_apps[a] += 1
+
     a_sos = {
-        pid: (sos[pid] / opp_counts[pid]) if opp_counts[pid] > 0 else 0.0
+        pid: (sos_sum[pid] / opp_apps[pid]) if opp_apps[pid] > 0 else 0.0
         for pid in players
     }
 
-    ordered = sorted(players.values(), key=lambda x: (-x.points, -a_sos[x.id], x.name))
+    # (Optional) keep old unique-opponent SOS for reference/debug
+    # uniq_sos = {pid: sum(players[q].points for q in players[pid].opponents if q in players) for pid in players}
+    # uniq_cnt = {pid: len([q for q in players[pid].opponents if q in players]) for pid in players}
+
+    ordered = sorted(
+        players.values(),
+        key=lambda x: (-x.points, -a_sos[x.id], x.name)
+    )
+
     rows = []
     for idx, p in enumerate(ordered, start=1):
-        status = "Dropped" if p.dropped else ""
-        rows.append({"Rank": idx, "Name": p.name, "Points": p.points, "SOS": round(a_sos[p.id],3), "Status": status})
+        rows.append({
+            "Rank": idx,
+            "Name": p.name,
+            "Points": p.points,
+            "A-SOS": round(a_sos[p.id], 3),
+            "Opp Apps": opp_apps[p.id],          # how many opponent slots faced
+            # "SOS(unique)": uniq_sos.get(p.id, 0),  # optional debug columns
+            # "Opp Unique": uniq_cnt.get(p.id, 0),
+            "Status": "Dropped" if p.dropped else ""
+        })
     return rows
 
 # def award_timeout_points(rno):
@@ -531,17 +539,20 @@ if st.session_state.rounds:
 
                 for i, pod in enumerate(rnd.pods):
                     # Build options (Clear, Tie, and each player name)
-                    options = ["Clear (no winner)", "Tie"] + [st.session_state.players[pid].name for pid in pod.players]
+                    options = ["None (clear)", "Tie (everyone)", "Tie (custom)"] + [st.session_state.players[pid].name for pid in pod.players]
 
-                    # Figure out the current label
-                    current_label = "Clear (no winner)"
+                    current_label = "None (clear)"
                     if pod.winner == "Tie":
-                        current_label = "Tie"
+                        # show as custom if not everyone got a point
+                        if pod.tie_recipients and set(pod.tie_recipients) != set(pod.players):
+                            current_label = "Tie (custom)"
+                        else:
+                            current_label = "Tie (everyone)"
                     elif pod.winner in st.session_state.players:
                         current_label = st.session_state.players[pod.winner].name
 
                     st.markdown(f"**Pod {i+1}**")
-                    c1, c2 = st.columns([4, 1])  # select wide, button narrow
+                    c1, c2 = st.columns([4, 1])
 
                     with c1:
                         sel = st.selectbox(
@@ -549,36 +560,64 @@ if st.session_state.rounds:
                             options,
                             index=options.index(current_label) if current_label in options else 0,
                             key=f"cw_sel_{rnd.number}_{i}",
-                            label_visibility="collapsed",   # keeps rows aligned with the button
+                            label_visibility="collapsed",
                         )
+
+                    # When Tie (custom), render a checkbox for each player
+                    tie_ids = []
+                    if sel == "Tie (custom)":
+                        st.caption("Who gets 1 point?")
+                        cols = st.columns(len(pod.players))
+                        for j, pid in enumerate(pod.players):
+                            pname = st.session_state.players[pid].name
+                            default_checked = pid in (pod.tie_recipients or [])
+                            with cols[j]:
+                                chk = st.checkbox(pname, key=f"cw_tie_{rnd.number}_{i}_{pid}", value=default_checked)
+                                if chk:
+                                    tie_ids.append(pid)
 
                     with c2:
                         if st.button("Apply", key=f"cw_apply_{rnd.number}_{i}", use_container_width=True):
-                            # map UI label back to your helper’s inputs
-                            value = "" if sel.startswith("Clear") else sel
-                            change_pod_winner(rnd.number, i, value)
+                            change_pod_winner(rnd.number, i, sel, tie_ids=tie_ids)
+
 
             # Winner entry (if any pod has no winner and timeout not yet used to end the round)
+            # Winner entry (if any pod has no winner)
             if any(p.winner is None for p in rnd.pods):
                 st.markdown("#### Enter Winners")
-                winners = {}
+                winners = {}        # pod_index -> selection label
+                custom_ties = {}    # pod_index -> [player_ids]
+
                 for i, pod in enumerate(rnd.pods):
                     if pod.winner:
                         continue
-                    options = [st.session_state.players[pid].name for pid in pod.players]
-                    options.append("Tie")
-                    winners[i] = st.selectbox(f"Winner Pod {i+1}", [""] + options, key=f"w_{rnd.number}_{i}")
+
+                    name_by_id = {pid: st.session_state.players[pid].name for pid in pod.players}
+                    options = [name_by_id[pid] for pid in pod.players]
+                    options += ["Tie (everyone)", "Tie (custom)"]
+
+                    winners[i] = st.selectbox(
+                        f"Winner Pod {i+1}",
+                        [""] + options,
+                        key=f"w_{rnd.number}_{i}"
+                    )
+
+                    if winners[i] == "Tie (custom)":
+                        st.caption(f"Select who gets 1 point in Pod {i+1}:")
+                        chosen_ids = []
+                        cols = st.columns(len(pod.players))
+                        for j, pid in enumerate(pod.players):
+                            pname = name_by_id[pid]
+                            with cols[j]:
+                                chk = st.checkbox(pname, key=f"w_custom_{rnd.number}_{i}_{pid}")
+                                if chk:
+                                    chosen_ids.append(pid)
+                        custom_ties[i] = chosen_ids
+
                 if st.button("Save Results", key=f"save_{rnd.number}"):
                     clean = {i: w for i, w in winners.items() if w}
-                    submit_results(rnd.number, clean)
+                    submit_results(rnd.number, clean, custom_ties)
                     st.rerun()
-
-            # # Timeout controls for this round
-            # rem = time_remaining(rnd)
-            # if rem is not None and rem <= 0 and not rnd.timeout_awarded:
-            #     if st.button(f"Time's Up (Round {rnd.number}) → Award 1 point to everyone", key=f"to_{rnd.number}"):
-            #         award_timeout_points(rnd.number)
-            #         st.rerun()
 
 # --- Standings ---
 st.subheader("Standings")

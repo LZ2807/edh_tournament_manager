@@ -204,7 +204,7 @@ def pair_round(duration_minutes: int | None):
     MAX_TRIES = 300
     success = False
 
-    for _ in range(MAX_TRIES):
+    for i in range(MAX_TRIES):
         temp_pool = pool[:]
         random.shuffle(temp_pool)  # try a different order each attempt
         temp_pods: list[Pod] = []
@@ -214,13 +214,13 @@ def pair_round(duration_minutes: int | None):
             # Greedy take 'size' players; avoid exact pod repeats
             chosen = temp_pool[:size]
             # If this exact pod existed, try to tweak by swapping one seat
-            if exact_pod_exists(chosen):
+            if exact_pod_exists(chosen) or i == MAX_TRIES-1:
                 made = False
                 # Try some alternative combinations among the first few candidates
                 cap = min(len(temp_pool), max(size + 6, 12))
                 for combo in combinations(temp_pool[:cap], size):
                     combo = list(combo)
-                    if not exact_pod_exists(combo):
+                    if not exact_pod_exists(combo) or i == MAX_TRIES-1:
                         chosen = combo
                         made = True
                         break

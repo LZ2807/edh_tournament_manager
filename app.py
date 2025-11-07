@@ -8,6 +8,7 @@ SAVE_FILE = "tournament.json"
 
 POD_SIZE = 4
 MIN_POD = 3
+MAX_POD = 4
 WIN_POINTS = 5
 TIMEOUT_POINTS = 1
 
@@ -109,7 +110,48 @@ def create_backup(round):
 
 
 # ---------- Helpers ----------
+def rounds_started() -> bool:
+    return len(st.session_state.rounds) > 0
 
+def player_has_matches(pid: str) -> bool:
+    """Consider a player 'has matches' if they ever appeared in a pod or have points/opponents."""
+    p = st.session_state.players.get(pid)
+    if not p:
+        return False
+    if p.points > 0 or p.opponents:
+        return True
+    for rnd in st.session_state.rounds:
+        for pod in rnd.pods:
+            if pid in pod.players or pod.winner == pid:
+                return True
+    return False
+
+def delete_player(pid: str):
+    """Delete only before rounds start; otherwise tell user to Drop."""
+    if rounds_started():
+        st.info("Deletion disabled after Round 1 starts. Use Drop instead.")
+        return
+    if player_has_matches(pid):
+        st.info("Cannot delete a player who has participated. Use Drop instead.")
+        return
+
+    # Defensive cleanup (should be no rounds yet, but just in case)
+    for rnd in st.session_state.rounds:
+        for pod in rnd.pods:
+            if pod.winner is None and pid in pod.players:
+                pod.players = [x for x in pod.players if x != pid]
+
+    # Remove any pod-history entries that mention this player
+    st.session_state.pod_history = set(
+        sig for sig in st.session_state.pod_history
+        if pid not in sig.split("|")
+    )
+
+    # Remove the player
+    st.session_state.players.pop(pid, None)
+    save_state()
+    st.rerun()
+    
 def pod_key(pid_list):
     return "|".join(sorted(pid_list))
 
@@ -130,128 +172,97 @@ def can_join(pid, pod):
 
 def pair_round(duration_minutes: int | None):
     players = [p for p in not_dropped_players()]
-    if len(players) < MIN_POD:
+    n = len(players)
+
+    if n < MIN_POD:
         st.error("Need at least 3 active (not dropped) players to pair a round.")
+        return
+
+    # With only 3- and 4-player pods allowed, 5 players cannot be partitioned.
+    if n in (1, 2, 5):
+        st.error("Cannot form only 3- or 4-player pods with 5 players. Add or drop a player.")
         return
 
     # Sort by points desc then seed for stability/randomness
     players.sort(key=lambda p: (-p.points, p.seed))
     pool = [p.id for p in players]
-    pods = []
 
-    # Greedy + retry shuffle to avoid exact pod repeats
-    MAX_TRIES = 200
+    # Decide exact pod sizes we want: only 3s and 4s, never >4
+    r = n % 4
+    # Minimal number of 3-pods to cover leftovers (classic composition)
+    needed_3 = {0: 0, 1: 3, 2: 2, 3: 1}[r]
+    # (For r==1 we need at least 9 players; n==5 already handled above.)
+    if r == 1 and n < 9:
+        st.error("With 5 players disallowed, the smallest valid 'r==1' case is 9 (three 3-pods). Add/drop players.")
+        return
+    num4 = (n - 3 * needed_3) // 4
+    sizes = [4] * num4 + [3] * needed_3  # e.g., [4,4,3] etc.
+
+    pods: list[Pod] = []
+    MAX_TRIES = 300
     success = False
-    for attempt in range(MAX_TRIES):
+
+    for _ in range(MAX_TRIES):
         temp_pool = pool[:]
-        temp_pods = []
+        random.shuffle(temp_pool)  # try a different order each attempt
+        temp_pods: list[Pod] = []
         ok = True
 
-        # try clean 4s
-        while len(temp_pool) >= POD_SIZE:
-            # pick first, then greedily fill
-            candidate = [temp_pool[0]]
-            for q in temp_pool[1:]:
-                if can_join(q, candidate):
-                    candidate.append(q)
-                    if len(candidate) == POD_SIZE:
-                        break
-            if len(candidate) < POD_SIZE:
-                ok = False
-                break
-            # check exact pod repeat
-            if exact_pod_exists(candidate):
-                # try alternate combos among the next few players
+        for size in sizes:
+            # Greedy take 'size' players; avoid exact pod repeats
+            chosen = temp_pool[:size]
+            # If this exact pod existed, try to tweak by swapping one seat
+            if exact_pod_exists(chosen):
                 made = False
-                for combo in combinations(temp_pool[:min(10, len(temp_pool))], POD_SIZE):
+                # Try some alternative combinations among the first few candidates
+                cap = min(len(temp_pool), max(size + 6, 12))
+                for combo in combinations(temp_pool[:cap], size):
                     combo = list(combo)
-                    if combo[0] != candidate[0]:  # keep some stability but try others
-                        continue
                     if not exact_pod_exists(combo):
-                        candidate = combo
+                        chosen = combo
                         made = True
                         break
                 if not made:
                     ok = False
                     break
-            for pid in candidate:
-                temp_pool.remove(pid)
-            temp_pods.append(Pod(players=candidate))
 
-        if not ok:
-            random.shuffle(pool)
-            continue
+            # Commit this pod and remove its players from pool
+            pid_set = set(chosen)
+            temp_pool = [x for x in temp_pool if x not in pid_set]
+            temp_pods.append(Pod(players=chosen))
 
-        # leftovers → 3-pod or merge into last
-        if len(temp_pool) >= MIN_POD:
-            if exact_pod_exists(temp_pool):
-                ok = False
-            else:
-                temp_pods.append(Pod(players=temp_pool[:]))
-            temp_pool = []
-        elif len(temp_pool) > 0:
-            # merge 1–2 leftovers into previous pod (keeps no exact repeat for that pod)
-            if not temp_pods:
-                ok = False
-            else:
-                merged = temp_pods[-1].players + temp_pool
-                if exact_pod_exists(merged):
-                    ok = False
-                else:
-                    temp_pods[-1].players = merged
-            temp_pool = []
-
-        if ok:
+        if ok and len(temp_pool) == 0:
             pods = temp_pods
             success = True
             break
-        else:
-            random.shuffle(pool)
 
     if not success:
-        st.warning("Could not avoid repeating a pod with current constraints. Forming best-effort pods.")
-        # Best-effort fallback (still tries to avoid exact repeats where possible)
-        pool = [p.id for p in players]
-        while len(pool) >= POD_SIZE:
-            candidate = pool[:POD_SIZE]
-            # swap to avoid exact repeat if needed
-            if exact_pod_exists(candidate) and len(pool) > POD_SIZE:
-                for i in range(POD_SIZE, len(pool)):
-                    swapped = candidate[:-1] + [pool[i]]
-                    if not exact_pod_exists(swapped):
-                        candidate = swapped
-                        # perform actual swap in pool ordering
-                        pool[i], pool[POD_SIZE-1] = pool[POD_SIZE-1], pool[i]
-                        break
-            pods.append(Pod(players=candidate))
-            pool = pool[POD_SIZE:]
-        if len(pool) >= MIN_POD:
-            if exact_pod_exists(pool):
-                st.warning("Leftover 3-pod repeats an earlier pod.")
-            pods.append(Pod(players=pool[:]))
-            pool = []
-        elif len(pool) > 0:
-            pods[-1].players.extend(pool)
-            if exact_pod_exists(pods[-1].players):
-                st.warning("Merged pod repeats an earlier pod.")
+        st.error("Could not form pods without repeats under current constraints. Try clicking again or toggling a drop.")
+        return
 
-    # Create round
+    # Create round (timer etc.)
     rno = len(st.session_state.rounds) + 1
-    rnd = Round(number=rno, pods=pods, start_ts=time.time() if duration_minutes else None, duration_minutes=duration_minutes)
+    rnd = Round(
+        number=rno,
+        pods=pods,
+        start_ts=time.time() if duration_minutes else None,
+        duration_minutes=duration_minutes
+    )
     st.session_state.rounds.append(rnd)
 
-    # Update opponent history (everyone in a pod are opponents)
+    # Update opponent history
     players_map = st.session_state.players
     for pod in pods:
+        assert 3 <= len(pod.players) <= 4, "Pod size invariant violated"
         for a in pod.players:
             for b in pod.players:
                 if a != b:
                     players_map[a].opponents.add(b)
 
-    # Record pod signatures
+    # Record pod signatures & persist
     record_pods_in_history(pods)
-
     save_state()
+    
 
 def submit_results(rno, winners):
     rnd = st.session_state.rounds[rno-1]
@@ -319,54 +330,61 @@ def time_remaining(rnd: Round):
 # ---------- UI ----------
 
 st.set_page_config(page_title="Commander Tournament", page_icon="🎴", layout="wide")
-st.title("Commander Tournament JUZ 2025")
+st.title("Commander Tournament Fall 2025")
 
 load_state()
-
-# --- Player Management ---
 with st.sidebar:
     st.header("Players")
+
+    # Add player form
     with st.form("add_player_form", clear_on_submit=True):
         name = st.text_input("Add player name")
         submitted = st.form_submit_button("Add Player")
-
         if submitted and name.strip():
             pid = str(uuid.uuid4())[:8]
             st.session_state.players[pid] = Player(pid, name.strip())
             save_state()
             st.rerun()
 
+    # Reset section
     if st.button("Reset All", use_container_width=True):
         st.session_state.show_reset_confirm = True
 
-    col1, col2 = st.columns(2)
     if st.session_state.get("show_reset_confirm", False):
-        st.warning("Are you sure you want to reset the game (this can't be undone)?",)
-        with col1:
-            if st.button("Yes", use_container_width=True):
+        st.warning("Are you sure you want to reset the game (this can't be undone)?")
+        c1, c2 = st.columns(2)  # these columns are inside the sidebar block
+        with c1:
+            if st.button("✅ Yes", use_container_width=True):
                 st.session_state.clear()
                 if os.path.exists(SAVE_FILE):
                     os.remove(SAVE_FILE)
                 st.rerun()
-        with col2:
-            if st.button("Cancel", use_container_width=True):
+        with c2:
+            if st.button("❌ Cancel", use_container_width=True):
                 st.session_state.show_reset_confirm = False
                 st.rerun()
 
+    st.divider()
+    st.subheader("Active players")
 
     if st.session_state.players:
-        st.caption("Drop/Undrop players (dropped players won't be paired).")
+        st.caption("Drop = exclude from future pairings. Delete = only before Round 1 starts.")
+        if rounds_started():
+            st.info("Round 1 has started — deletion disabled. Use Drop instead.")
+
         for p in sorted(st.session_state.players.values(), key=lambda x: x.name.lower()):
-            with col1:
-                dropped = st.checkbox(f"{p.name}", value=p.dropped, key=f"drop_{p.id}")
+            row_left, row_right = st.columns([8, 2])  # inside sidebar block
+            with row_left:
+                dropped = st.checkbox(p.name, value=p.dropped, key=f"drop_{p.id}")
                 if dropped != p.dropped:
                     p.dropped = dropped
                     save_state()
-
-            with col2:
-                pass
-                # if st.button("🗑", key= f"del_{p.name}"):
-                #     print(st.session_state.players)
+            with row_right:
+                can_delete = (not rounds_started()) and (not player_has_matches(p.id))
+                if st.button("🗑️", key=f"del_{p.id}", disabled=not can_delete, help="Delete player (only before Round 1)"):
+                    delete_player(p.id)
+    else:
+        st.info("No players yet — add some above.")
 
 # --- Pairings & Timer ---
 st.subheader("Pairings")

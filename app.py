@@ -3,6 +3,8 @@ import random, uuid, json, os, time
 from dataclasses import dataclass, field, asdict
 from itertools import combinations
 from streamlit_autorefresh import st_autorefresh
+import pandas as pd
+from io import StringIO
 
 SAVE_FILE = "tournament.json"
 
@@ -288,19 +290,103 @@ def submit_results(rno, winners):
         players[wid].points += WIN_POINTS
     save_state()
     create_backup(rnd)
+def change_pod_winner(rno: int, pod_index: int, new_winner_label: str):
+    """Change/clear a pod's winner and fix points accordingly.
+       new_winner_label can be: 'None (clear)', 'Tie', a player name, or a player id.
+    """
+    rnd = st.session_state.rounds[rno - 1]
+    pod = rnd.pods[pod_index]
+    players = st.session_state.players
+
+    # map names -> ids
+    name_to_id = {p.name.lower(): p.id for p in players.values()}
+
+    # ---- rollback old result ----
+    prev = pod.winner
+    if prev is not None:
+        if prev == "Tie":
+            for pid in pod.players:
+                players[pid].points = max(0, players[pid].points - 1)
+        else:
+            # prev should be a player id
+            if prev in players:
+                players[prev].points = max(0, players[prev].points - WIN_POINTS)
+
+    # ---- apply new result ----
+    if new_winner_label in (None, "", "None", "None (clear)"):
+        pod.winner = None
+    elif new_winner_label == "Tie":
+        pod.winner = "Tie"
+        for pid in pod.players:
+            players[pid].points += 1
+    else:
+        # accept player id or name
+        if new_winner_label in players:
+            wid = new_winner_label
+        else:
+            wid = name_to_id.get(new_winner_label.lower())
+        if wid is None or wid not in pod.players:
+            st.error(f"New winner '{new_winner_label}' is not in Pod {pod_index+1}.")
+            return
+        pod.winner = wid
+        players[wid].points += WIN_POINTS
+
+    save_state()
+    # optional: keep your backup snapshot
+    create_backup(rnd)
+    st.rerun()
+
+def export_standings_csv():
+    df = pd.DataFrame(standings_rows())
+    return df.to_csv(index=False)
+
+def export_history_csv():
+    """Flatten all rounds and pods into a simple CSV table."""
+    rows = []
+    for rnd in st.session_state.rounds:
+        for i, pod in enumerate(rnd.pods, start=1):
+            players = [st.session_state.players[pid].name for pid in pod.players]
+            if pod.winner == "Tie":
+                winner_name = "Tie"
+            elif pod.winner and pod.winner in st.session_state.players:
+                winner_name = st.session_state.players[pod.winner].name
+            elif pod.winner:
+                winner_name = pod.winner
+            else:
+                winner_name = ""
+            rows.append({
+                "Round": rnd.number,
+                "Pod": i,
+                "Players": ", ".join(players),
+                "Winner": winner_name,
+                "Duration (min)": rnd.duration_minutes or "",
+                "Timeout Awarded": rnd.timeout_awarded,
+            })
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False)
 
 def standings_rows():
     players = st.session_state.players
     # SOS tiebreaker (sum of opponents' points)
-    sos = {pid: 0 for pid in players}
-    for pid, p in players.items():
-        sos[pid] = sum(players[q].points for q in p.opponents if q in players)
 
-    ordered = sorted(players.values(), key=lambda x: (-x.points, -sos[x.id], x.name))
+    sos = {}
+    opp_counts = {}
+    for pid, p in players.items():
+        opp_ids = [q for q in p.opponents if q in players]
+        opp_counts[pid] = len(opp_ids)
+        sos[pid] = sum(players[q].points for q in opp_ids)
+
+    # Average SOS (handles uneven pod sizes)
+    a_sos = {
+        pid: (sos[pid] / opp_counts[pid]) if opp_counts[pid] > 0 else 0.0
+        for pid in players
+    }
+
+    ordered = sorted(players.values(), key=lambda x: (-x.points, -a_sos[x.id], x.name))
     rows = []
     for idx, p in enumerate(ordered, start=1):
         status = "Dropped" if p.dropped else ""
-        rows.append({"Rank": idx, "Name": p.name, "Points": p.points, "SOS": sos[p.id], "Status": status})
+        rows.append({"Rank": idx, "Name": p.name, "Points": p.points, "SOS": round(a_sos[p.id],3), "Status": status})
     return rows
 
 # def award_timeout_points(rno):
@@ -428,6 +514,49 @@ if st.session_state.rounds:
                     else:
                         line += f" — Winner: **{st.session_state.players[pod.winner].name}**"
                 st.markdown(line)
+            
+            # --- Change winners (toggleable) ---
+            show_cw = st.toggle("Change Winner", value=False, key=f"cw_toggle_{rnd.number}")
+
+            if show_cw:
+                st.markdown("##### Edit results")
+
+                # optional: tiny CSS so select + button align nicely
+                st.markdown("""
+                    <style>
+                    /* reduce vertical gap under selectboxes for a tighter row */
+                    div[data-baseweb="select"] > div { margin-bottom: 0.25rem; }
+                    </style>
+                """, unsafe_allow_html=True)
+
+                for i, pod in enumerate(rnd.pods):
+                    # Build options (Clear, Tie, and each player name)
+                    options = ["Clear (no winner)", "Tie"] + [st.session_state.players[pid].name for pid in pod.players]
+
+                    # Figure out the current label
+                    current_label = "Clear (no winner)"
+                    if pod.winner == "Tie":
+                        current_label = "Tie"
+                    elif pod.winner in st.session_state.players:
+                        current_label = st.session_state.players[pod.winner].name
+
+                    st.markdown(f"**Pod {i+1}**")
+                    c1, c2 = st.columns([4, 1])  # select wide, button narrow
+
+                    with c1:
+                        sel = st.selectbox(
+                            "new winner",
+                            options,
+                            index=options.index(current_label) if current_label in options else 0,
+                            key=f"cw_sel_{rnd.number}_{i}",
+                            label_visibility="collapsed",   # keeps rows aligned with the button
+                        )
+
+                    with c2:
+                        if st.button("Apply", key=f"cw_apply_{rnd.number}_{i}", use_container_width=True):
+                            # map UI label back to your helper’s inputs
+                            value = "" if sel.startswith("Clear") else sel
+                            change_pod_winner(rnd.number, i, value)
 
             # Winner entry (if any pod has no winner and timeout not yet used to end the round)
             if any(p.winner is None for p in rnd.pods):
@@ -457,3 +586,7 @@ if st.session_state.players:
     st.dataframe(standings_rows(), hide_index=True, use_container_width=True)
 else:
     st.info("Add players to begin.")
+
+with st.expander("📤 Export Data"):
+    st.download_button("📥 Game History CSV", export_history_csv(), "tournament_history.csv", "text/csv")
+    st.download_button("📊 Standings CSV", export_standings_csv(), "tournament_standings.csv", "text/csv")

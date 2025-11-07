@@ -1,12 +1,3 @@
-# Core framework
 streamlit==1.39.0
-
-# Data handling and JSON I/O
 pandas==2.2.3
 pyarrow==17.0.0
-
-# Misc utilities (safe, lightweight)
-altair==5.4.1
-
-# Optional — ensures reproducible numeric behavior
-numpy==1.26.4

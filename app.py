@@ -189,6 +189,111 @@ def pair_round(duration_minutes: int | None):
     n = len(players)
 
     if n < MIN_POD:
+        st.error("Need at least 3 active (not dropped) players to pair a round.")
+        return
+
+    # With only 3- and 4-player pods allowed, 5 players cannot be partitioned.
+    if n in (1, 2, 5):
+        st.error("Cannot form only 3- or 4-player pods with 5 players. Add or drop a player.")
+        return
+
+    # Sort by points desc then seed for stability/randomness
+    players.sort(key=lambda p: (-p.points, p.seed))
+    ids = [p.id for p in players]   
+
+    # Decide exact pod sizes we want: only 3s and 4s, never >4
+    r = n % 4
+    # Minimal number of 3-pods to cover leftovers (classic composition)
+    needed_3 = {0: 0, 1: 3, 2: 2, 3: 1}[r]
+    # (For r==1 we need at least 9 players; n==5 already handled above.)
+    if r == 1 and n < 9:
+        st.error("With 5 players disallowed, the smallest valid 'r==1' case is 9 (three 3-pods). Add/drop players.")
+        return
+    num4 = (n - 3 * needed_3) // 4
+    # ---- key change: reserve the lowest-point players for the 3-pods ----
+    low_block = ids[-3 * needed_3:] if needed_3 else []
+    high_block = ids[: n - 3 * needed_3]
+
+    def form_pods_from_pool(pool_ids, pod_size, max_tries=250):
+        """Greedy with small local search to avoid exact pod repeats."""
+        if not pool_ids:
+            return []
+        pods_local = None
+        base = pool_ids[:]  # keep order mostly (Swiss-y)
+        for _ in range(max_tries):
+            tmp = base[:]
+            # tiny shuffle to escape dead-ends without breaking bracket intent
+            random.shuffle(tmp)
+            built = []
+            ok = True
+            while len(tmp) >= pod_size:
+                candidate = tmp[:pod_size]
+                if exact_pod_exists(candidate):
+                    made = False
+                    cap = min(len(tmp), max(pod_size + 6, 12))
+                    for combo in combinations(tmp[:cap], pod_size):
+                        combo = list(combo)
+                        if not exact_pod_exists(combo):
+                            candidate = combo
+                            made = True
+                            break
+                    if not made:
+                        ok = False
+                        break
+                chosen = set(candidate)
+                tmp = [x for x in tmp if x not in chosen]
+                built.append(Pod(players=candidate))
+            if ok and not tmp:
+                pods_local = built
+                break
+        return pods_local
+
+    pods: list[Pod] = []
+
+    # 1) Build 3-pods from the lowest-point players (priority to low points)
+    if needed_3:
+        pods3 = form_pods_from_pool(low_block, 3)
+        if pods3 is None:
+            st.error("Could not form 3-pods without repeats. Toggle a drop or try again.")
+            return
+        pods.extend(pods3)
+
+    # 2) Build 4-pods from the rest (higher points)
+    if num4:
+        pods4 = form_pods_from_pool(high_block, 4)
+        if pods4 is None:
+            st.error("Could not form 4-pods without repeats. Toggle a drop or try again.")
+            return
+        # show higher bracket first (nice for display)
+        pods = pods4 + pods
+
+    # Create round (timer etc.)
+    rno = len(st.session_state.rounds) + 1
+    rnd = Round(
+        number=rno,
+        pods=pods,
+        start_ts=time.time() if duration_minutes else None,
+        duration_minutes=duration_minutes
+    )
+    st.session_state.rounds.append(rnd)
+
+    # Update opponent history
+    players_map = st.session_state.players
+    for pod in pods:
+        assert 3 <= len(pod.players) <= 4, "Pod size invariant violated"
+        for a in pod.players:
+            for b in pod.players:
+                if a != b:
+                    players_map[a].opponents.add(b)
+
+    record_pods_in_history(pods)
+    save_state()
+
+def pair_round_swiss(duration_minutes: int | None):
+    players = [p for p in not_dropped_players()]
+    n = len(players)
+
+    if n < MIN_POD:
         st.warning("Need at least 3 active (not dropped) players to pair a round.")
         return
 
@@ -488,9 +593,16 @@ with left:
     active_count = len(not_dropped_players())
     st.write(f"Active players: **{active_count}**")
     duration = st.number_input("Round timer (minutes, optional)", min_value=0, max_value=180, value=0, step=5)
-    if st.button("Generate Next Round", use_container_width=True, disabled=active_count < MIN_POD):
-        pair_round(duration if duration > 0 else None)
-        st.rerun()
+
+    show_swiss = st.toggle("Swiss Mode", value=False, key="swiss_toggle")
+    if not show_swiss:
+        if st.button("Generate Next Round", use_container_width=True, disabled=active_count < MIN_POD):
+            pair_round(duration if duration > 0 else None)
+            st.rerun()
+    else:
+        if st.button("Generate Next Round", use_container_width=True, disabled=active_count < MIN_POD):
+            pair_round_swiss(duration if duration > 0 else None)
+            st.rerun()
 
 with right:
     if st.session_state.rounds:

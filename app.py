@@ -199,6 +199,48 @@ def compute_a_sos(include_only_completed_rounds: bool = True):
     }
     return a_sos, opp_apps
 
+def pair_count(a: str, b: str) -> int:
+    """How often did a and b already meet? (based on opponents set)."""
+    # Your opponents set is unique-only, so this is 0/1.
+    # Still useful as a penalty signal.
+    return 1 if b in st.session_state.players[a].opponents else 0
+
+def pod_repeat_score(pod_ids: list[str]) -> int:
+    """Penalty for how many repeated opponent-pairs are inside this pod."""
+    score = 0
+    for a, b in combinations(pod_ids, 2):
+        score += pair_count(a, b) + pair_count(b, a)
+    return score
+
+def pick_best_pod_from_pool(pool: list[str], size: int, sample_cap: int = 20):
+    """
+    Choose a pod of `size` from pool that minimizes repeated pairings.
+    Uses a limited search over first `sample_cap` ids for speed.
+    """
+    cap = min(len(pool), max(sample_cap, size))
+    candidates = list(pool[:cap])
+
+    best = None
+    best_score = None
+
+    for combo in combinations(candidates, size):
+        combo = list(combo)
+        score = pod_repeat_score(combo)
+
+        # Optional: avoid exact pod repeats if possible
+        if exact_pod_exists(combo):
+            score += 9999
+
+        if best is None or score < best_score:
+            best = combo
+            best_score = score
+
+            # perfect pod (no repeats at all) -> early exit
+            if best_score == 0:
+                break
+
+    return best
+
 def pod_sizes_only_3_4(n: int):
     """Return [4,4,...,3,3,...] or None if impossible (only 3- and 4-player pods allowed)."""
     if n in (1, 2, 5):
@@ -209,111 +251,127 @@ def pod_sizes_only_3_4(n: int):
         return None
     num4 = (n - 3 * needed_3) // 4
     return [4] * num4 + [3] * needed_3
+from collections import defaultdict
 
-def pair_round(duration_minutes: int | None):
+def build_pair_history(rounds):
+    """Return dict (a,b)->count and dict (a,b)->last_round_seen."""
+    count = defaultdict(int)
+    last_seen = defaultdict(lambda: -999999)
+
+    for rnd in rounds:
+        rno = rnd.number
+        for pod in rnd.pods:
+            ids = pod.players
+            for i in range(len(ids)):
+                for j in range(i+1, len(ids)):
+                    a, b = sorted((ids[i], ids[j]))
+                    count[(a,b)] += 1
+                    last_seen[(a,b)] = max(last_seen[(a,b)], rno)
+    return count, last_seen
+
+
+def score_partition(pods, pair_count, pair_last_seen, current_round_no,
+                    w_last=10000, w_recent=1500, w_old=100):
+    """
+    Lower is better.
+    - w_last: penalty if met in immediately previous round
+    - w_recent: penalty if met within last 2-3 rounds
+    - w_old: penalty per previous meeting overall
+    """
+    score = 0
+    for pod in pods:
+        ids = pod.players
+        for i in range(len(ids)):
+            for j in range(i+1, len(ids)):
+                a, b = sorted((ids[i], ids[j]))
+                c = pair_count.get((a,b), 0)
+                if c == 0:
+                    continue
+
+                last = pair_last_seen.get((a,b), -999999)
+                delta = current_round_no - last  # 1 means "last round"
+                if delta == 1:
+                    score += w_last
+                elif delta <= 3:
+                    score += w_recent
+                score += w_old * c
+    return score
+
+
+def pair_round(duration_minutes: int | None, tries: int = 800):
     players = [p for p in not_dropped_players()]
     n = len(players)
-
     if n < MIN_POD:
-        st.error("Need at least 3 active (not dropped) players to pair a round.")
+        st.warning("Need at least 3 active players.")
         return
 
-    # With only 3- and 4-player pods allowed, 5 players cannot be partitioned.
-    if n in (1, 2, 5):
-        st.error("Cannot form only 3- or 4-player pods with 5 players. Add or drop a player.")
+    sizes = pod_sizes_only_3_4(n)
+    if sizes is None:
+        st.warning("Cannot split into only 3- and 4-player pods with current player count.")
         return
 
-    # Sort by points desc then seed for stability/randomness
-    players.sort(key=lambda p: (-p.points, p.seed))
-    ids = [p.id for p in players]   
+    # IMPORTANT: If you want PURE diversity (not swiss), do NOT sort by points.
+    # If you still want a small swiss influence, you can sort by points first and then shuffle lightly.
+    ids = [p.id for p in players]
+    random.shuffle(ids)
 
-    # Decide exact pod sizes we want: only 3s and 4s, never >4
-    r = n % 4
-    # Minimal number of 3-pods to cover leftovers (classic composition)
-    needed_3 = {0: 0, 1: 3, 2: 2, 3: 1}[r]
-    # (For r==1 we need at least 9 players; n==5 already handled above.)
-    if r == 1 and n < 9:
-        st.error("With 5 players disallowed, the smallest valid 'r==1' case is 9 (three 3-pods). Add/drop players.")
-        return
-    num4 = (n - 3 * needed_3) // 4
-    # ---- key change: reserve the lowest-point players for the 3-pods ----
-    low_block = ids[-3 * needed_3:] if needed_3 else []
-    high_block = ids[: n - 3 * needed_3]
+    current_rno = len(st.session_state.rounds) + 1
+    pair_count, pair_last_seen = build_pair_history(st.session_state.rounds)
 
-    def form_pods_from_pool(pool_ids, pod_size, max_tries=250):
-        """Greedy with small local search to avoid exact pod repeats."""
-        if not pool_ids:
-            return []
-        pods_local = None
-        base = pool_ids[:]  # keep order mostly (Swiss-y)
-        for _ in range(max_tries):
-            tmp = base[:]
-            # tiny shuffle to escape dead-ends without breaking bracket intent
-            random.shuffle(tmp)
-            built = []
-            ok = True
-            while len(tmp) >= pod_size:
-                candidate = tmp[:pod_size]
-                if exact_pod_exists(candidate):
-                    made = False
-                    cap = min(len(tmp), max(pod_size + 6, 12))
-                    for combo in combinations(tmp[:cap], pod_size):
-                        combo = list(combo)
-                        if not exact_pod_exists(combo):
-                            candidate = combo
-                            made = True
-                            break
-                    if not made:
-                        ok = False
-                        break
-                chosen = set(candidate)
-                tmp = [x for x in tmp if x not in chosen]
-                built.append(Pod(players=candidate))
-            if ok and not tmp:
-                pods_local = built
+    best_pods = None
+    best_score = float("inf")
+
+    # We want 3-pods to be formed when required by sizes; no >4 ever.
+    # We'll chunk after shuffling according to sizes.
+    for _ in range(tries):
+        tmp = ids[:]
+        random.shuffle(tmp)
+
+        pods = []
+        pos = 0
+        ok = True
+        for sz in sizes:
+            chunk = tmp[pos:pos+sz]
+            pos += sz
+            if len(chunk) != sz:
+                ok = False
                 break
-        return pods_local
+            pods.append(Pod(players=chunk))
+        if not ok:
+            continue
 
-    pods: list[Pod] = []
+        sc = score_partition(pods, pair_count, pair_last_seen, current_rno)
+        if sc < best_score:
+            best_score = sc
+            best_pods = pods
 
-    # 1) Build 3-pods from the lowest-point players (priority to low points)
-    if needed_3:
-        pods3 = form_pods_from_pool(low_block, 3)
-        if pods3 is None:
-            st.error("Could not form 3-pods without repeats. Toggle a drop or try again.")
-            return
-        pods.extend(pods3)
+            # if we found a partition with zero "met last round" collisions, that's usually good enough
+            # (optional early stop)
+            # if sc < 1000: break
 
-    # 2) Build 4-pods from the rest (higher points)
-    if num4:
-        pods4 = form_pods_from_pool(high_block, 4)
-        if pods4 is None:
-            st.error("Could not form 4-pods without repeats. Toggle a drop or try again.")
-            return
-        # show higher bracket first (nice for display)
-        pods = pods4 + pods
+    if best_pods is None:
+        st.error("Could not generate pods.")
+        return
 
-    # Create round (timer etc.)
-    rno = len(st.session_state.rounds) + 1
     rnd = Round(
-        number=rno,
-        pods=pods,
+        number=current_rno,
+        pods=best_pods,
         start_ts=time.time() if duration_minutes else None,
         duration_minutes=duration_minutes
     )
     st.session_state.rounds.append(rnd)
 
-    # Update opponent history
-    players_map = st.session_state.players
-    for pod in pods:
-        assert 3 <= len(pod.players) <= 4, "Pod size invariant violated"
+    # Only track opponents for SOS *after rounds are completed* in your SOS function.
+    # But keeping opponent sets updated is fine if your SOS skips incomplete rounds.
+    for pod in best_pods:
         for a in pod.players:
             for b in pod.players:
                 if a != b:
-                    players_map[a].opponents.add(b)
+                    st.session_state.players[a].opponents.add(b)
 
-    record_pods_in_history(pods)
+    record_pods_in_history(best_pods)  # optional
     save_state()
+    create_backup(rnd)
     
 def pair_round_swiss(duration_minutes: int | None):
     players = [p for p in not_dropped_players()]
@@ -449,6 +507,51 @@ def change_pod_winner(rno: int, pod_index: int, new_winner_label: str, tie_ids: 
     save_state()
     create_backup(rnd)
     st.rerun()
+
+def delete_last_round():
+    if not st.session_state.rounds:
+        st.warning("No rounds to delete.")
+        return
+
+    rnd = st.session_state.rounds[-1]
+
+    # --- rollback points ---
+    players = st.session_state.players
+    for pod in rnd.pods:
+        if pod.winner == "Tie":
+            recips = pod.tie_recipients if pod.tie_recipients else pod.players
+            for pid in recips:
+                players[pid].points = max(0, players[pid].points - 1)
+        elif pod.winner and pod.winner in players:
+            players[pod.winner].points = max(
+                0, players[pod.winner].points - WIN_POINTS
+            )
+
+    # --- rollback opponent history ---
+    # easiest + safest: rebuild opponents from remaining rounds
+    for p in players.values():
+        p.opponents.clear()
+
+    for r in st.session_state.rounds[:-1]:
+        for pod in r.pods:
+            for a in pod.players:
+                for b in pod.players:
+                    if a != b:
+                        players[a].opponents.add(b)
+
+    # --- remove pod history entries from this round ---
+    for pod in rnd.pods:
+        sig = pod_key(pod.players)
+        st.session_state.pod_history.discard(sig)
+
+    # --- remove round ---
+    st.session_state.rounds.pop()
+
+    save_state()
+
+    st.success(f"🗑️ Deleted Round {rnd.number}")
+    st.rerun()
+
 
 def export_standings_csv():
     df = pd.DataFrame(standings_rows())
@@ -631,7 +734,13 @@ if st.session_state.rounds:
                     else:
                         line += f" — Winner: **{st.session_state.players[pod.winner].name}**"
                 st.markdown(line)
-            
+            if rnd.number == len(st.session_state.rounds):
+                if st.button(
+                    "🗑️ Delete this round",
+                    key=f"del_round_{rnd.number}",
+                    type="secondary",
+                ):
+                    delete_last_round()
             # --- Change winners (toggleable) ---
             show_cw = st.toggle("Change Winner", value=False, key=f"cw_toggle_{rnd.number}")
 

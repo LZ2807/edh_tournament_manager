@@ -2,7 +2,6 @@ import streamlit as st
 import random, uuid, json, os, time
 from dataclasses import dataclass, field, asdict
 from itertools import combinations
-from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from io import StringIO
 
@@ -743,8 +742,17 @@ with st.sidebar:
         st.info("No players yet — add some above.")
 
 # --- Pairings & Timer ---
+@st.fragment(run_every=1)
+def live_timer(rnd: Round):
+    rem = time_remaining(rnd)
+
+    if rem is None:
+        st.info("No active timer for the latest round.")
+    elif rem > 0:
+        st.metric("Time remaining in current round", f"{rem//60:02d}:{rem%60:02d}")
+    else:
+        st.metric("Time remaining in current round", "00:00")
 st.subheader("Pairings")
-st_autorefresh(interval=5000, key="timer_refresh")
 left, right = st.columns([1,1])
 with left:
     active_count = len(not_dropped_players())
@@ -764,18 +772,9 @@ with left:
 with right:
     if st.session_state.rounds:
         rnd = st.session_state.rounds[-1]
-        rem = time_remaining(rnd)
-        if rem is not None:
-            if rem > 0:
-                st.metric("Time remaining in current round", f"{rem//60:02d}:{rem%60:02d}")
-            else:
-                st.metric("Time remaining in current round", "00:00")
-                # if not rnd.timeout_awarded:
-                #     if st.button("Time's Up → Award 1 point to everyone this round", type="primary"):
-                #         award_timeout_points(rnd.number)
-                #         st.rerun()
-        else:
-            st.info("No active timer for the latest round.")
+        live_timer(rnd)
+    else:
+        st.info("No active timer.")
 
 # --- Rounds Display ---
 if st.session_state.rounds:

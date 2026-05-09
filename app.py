@@ -625,7 +625,64 @@ def time_remaining(rnd: Round):
     end_ts = rnd.start_ts + rnd.duration_minutes * 60
     remaining = int(end_ts - time.time())
     return remaining
+def rebuild_pairing_history():
+    """Rebuild opponents and pod_history from all existing round pairings."""
+    for p in st.session_state.players.values():
+        p.opponents = set()
 
+    st.session_state.pod_history = set()
+
+    for rnd in st.session_state.rounds:
+        for pod in rnd.pods:
+            st.session_state.pod_history.add(pod_key(pod.players))
+            for a in pod.players:
+                for b in pod.players:
+                    if a != b and a in st.session_state.players and b in st.session_state.players:
+                        st.session_state.players[a].opponents.add(b)
+
+
+def find_player_pod(rnd: Round, pid: str):
+    """Return pod index containing pid, or None."""
+    for i, pod in enumerate(rnd.pods):
+        if pid in pod.players:
+            return i
+    return None
+
+
+def swap_players_in_round(round_number: int, pid_a: str, pid_b: str):
+    rnd = st.session_state.rounds[round_number - 1]
+
+    # Do not allow swaps after any result was entered
+    if any(pod.winner is not None for pod in rnd.pods):
+        st.error("You can only swap players before results are entered for this round.")
+        return
+
+    if pid_a == pid_b:
+        st.warning("Choose two different players.")
+        return
+
+    pod_a_idx = find_player_pod(rnd, pid_a)
+    pod_b_idx = find_player_pod(rnd, pid_b)
+
+    if pod_a_idx is None or pod_b_idx is None:
+        st.error("Both players must be in this round.")
+        return
+
+    if pod_a_idx == pod_b_idx:
+        st.info("Both players are already in the same pod.")
+        return
+
+    pod_a = rnd.pods[pod_a_idx]
+    pod_b = rnd.pods[pod_b_idx]
+
+    idx_a = pod_a.players.index(pid_a)
+    idx_b = pod_b.players.index(pid_b)
+
+    pod_a.players[idx_a], pod_b.players[idx_b] = pid_b, pid_a
+
+    rebuild_pairing_history()
+    save_state()
+    st.rerun()
 # ---------- UI ----------
 
 st.set_page_config(page_title="Commander Tournament", page_icon="🎴", layout="wide")
@@ -741,6 +798,25 @@ if st.session_state.rounds:
                     type="secondary",
                 ):
                     delete_last_round()
+            # --- Swap players between pods ---
+            if rnd.number == len(st.session_state.rounds) and all(pod.winner is None for pod in rnd.pods):
+                show_swap = st.toggle("Swap players between pods", value=False, key=f"swap_toggle_{rnd.number}")
+
+                if show_swap:
+                    round_player_ids = [pid for pod in rnd.pods for pid in pod.players]
+                    name_to_id = {st.session_state.players[pid].name: pid for pid in round_player_ids}
+                    names = list(name_to_id.keys())
+
+                    c1, c2, c3 = st.columns([3, 3, 1])
+                    with c1:
+                        p1 = st.selectbox("Player A", names, key=f"swap_a_{rnd.number}")
+                    with c2:
+                        p2 = st.selectbox("Player B", names, key=f"swap_b_{rnd.number}")
+                    with c3:
+                        st.write("")
+                        st.write("")
+                        if st.button("Swap", key=f"swap_btn_{rnd.number}", use_container_width=True):
+                            swap_players_in_round(rnd.number, name_to_id[p1], name_to_id[p2])
             # --- Change winners (toggleable) ---
             show_cw = st.toggle("Change Winner", value=False, key=f"cw_toggle_{rnd.number}")
 
